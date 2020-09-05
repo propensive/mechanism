@@ -6,104 +6,163 @@ import scala.concurrent._
 import scala.collection.mutable.HashSet
 import scala.util.control.NonFatal
 import scala.util._
+import scala.collection.generic.CanBuildFrom
 
 import java.util.function.Supplier
-import java.util.concurrent._, locks._
+import java.util.concurrent._, locks._, atomic._
+
+object `package` {
+  implicit class IterableExtensions[Coll[S] <: Iterable[S], T](xs: Coll[Task[T]]) {
+    def sequence(implicit cbf: CanBuildFrom[Nothing, T, Coll[T]]): Task[Coll[T]] = Mechanism.sequence(xs)(cbf)
+  }
+}
 
 case class Context(task: Task[_]) { thisContext =>
-  def progress(percent: Int): Unit = task.completion = percent
-  var aborted: Boolean = false
+  def progress(value: Double): Unit = {
+    if((task.completion*100).toInt < (value*100).toInt) task.listener(Progress((value*100).toInt))
+    task.completion = value
+  }
   
-  def subtasks: Set[Task[_]] = task.subtaskSet.to[Set]
+  def subtasks: Set[Task[_]] = Mechanism.getSubtasks(task)
 
   def pause(duration: Long): Unit = try {
-    Mechanism.sleep(task)
-    Thread.sleep(duration)
-  } catch { case _: InterruptedException => () } finally {
-    Mechanism.unsleep(task)
+    Task.sleep(task)
+    LockSupport.parkNanos(duration*1000000L)
+  } catch { case _: InterruptedException => () } finally Task.unsleep(task)
+
+  def spawn[T](id: String)(action: Context => T): Task[T] =
+    Mechanism.spawn(task, id) { ctx => Try(action(ctx)) }
+
+  def abort(): Task[Unit] = {
+    Mechanism.cancel(task)
+    //throw CancelException()
   }
 
-  def sequence[T](tasks: List[Task[T]]) = {
-    new Task[List[T]](thisContext, s"${task.name}/sequence") { newTask =>
-      val future: CompletableFuture[Try[List[T]]] = {
-        task.synchronized(task.subtaskSet += newTask)
-        CompletableFuture.allOf(tasks.map(_.future): _*).thenApply({ _ =>
-          task.synchronized(task.subtaskSet -= this)
-          tasks.map(_.future.get()).sequence
-        })
-      }
-    }
+  def defaultHandler: PartialFunction[ProcessAction, Unit] = {
+    case Terminate => throw CancelException()
+    case Suspend   => LockSupport.park()
   }
 
-  def child[T](subtaskName: String, isolated: Boolean = false)(action: Context => T): Task[T] = {
-    new Task[T](thisContext, s"${task.name}/$subtaskName") { newTask =>
-      val future: CompletableFuture[Try[T]] = CompletableFuture.supplyAsync({ () =>
-        val thread = Thread.currentThread
-        task.synchronized(task.subtaskSet += newTask)
-        val oldName: String = thread.getName
-        thread.setName(name)
-        val ctx = Context(newTask)
-        try Success(action(ctx)) catch { case NonFatal(e) => Failure(e) } finally {
-          task.synchronized(task.subtaskSet -= this)
-          thread.setName(oldName)
-        }
-      }, Mechanism.executor)
+  def juncture(pf: PartialFunction[ProcessAction, Unit]): Unit =
+    pf.orElse(defaultHandler).lift {
+      if(task.cancelled) Terminate else Continue
     }
-  }
+
 }
 
-abstract class Task[T](parentContext: Context, val name: String) { task =>
-  protected[mechanism] var completion: Int = 0
-  protected[mechanism] var interrupted: Boolean = false
-  protected[mechanism] def future: java.util.concurrent.CompletableFuture[Try[T]]
-  protected[mechanism] val subtaskSet: HashSet[Task[_]] = new HashSet()
+case class CancelException() extends RuntimeException()
+
+sealed trait ProcessAction
+case object Terminate extends ProcessAction
+case object Suspend extends ProcessAction
+case object Continue extends ProcessAction
+
+abstract class Task[T](val parent: Option[Task[_]], val id: String, val listener: Update => Unit) { task =>
+  def name: String = s"${parent.fold("mechanism:/")(_.name)}/$id"
+  private[mechanism] var completion: Double = 0
+  private[mechanism] var cancelled: Boolean = false
+  private[mechanism] val future: java.util.concurrent.CompletableFuture[Try[T]]
   override def toString: String = name
   def await(): Try[T] = future.join()
-  def shutdown(): Unit = synchronized(subtaskSet.foreach(_.shutdown()))
+  
+  def then[S](subName: String)(action: Context => T => S): Task[S] =
+    Mechanism.spawnPeer(this, subName) { ctx => future.join().map(action(ctx)(_)) }
+  
+  def map[S](fn: T => S): Task[S] = new Task[S](parent, id, listener) {
+    private[mechanism] val future: java.util.concurrent.CompletableFuture[Try[S]] =
+      task.future.thenApply { value => value.map(fn) }
+  }
 
-  def then[S](name: String, isolated: Boolean = false)(action: Context => T => S): Task[S] = {
-    val newTask = new Task[S](parentContext, s"${parentContext.task.name}/$name") { newTask =>
-      val future: CompletableFuture[Try[S]] = task.future.thenApplyAsync({ t =>
-        val thread = Thread.currentThread
-        val oldName: String = thread.getName
-        thread.setName(name)
-        task.synchronized(parentContext.task.subtaskSet += newTask)
-        val ctx = Context(newTask)
-        try t.map(action(ctx)) catch { case NonFatal(e) => Failure(e) } finally {
-          task.synchronized(parentContext.task.subtaskSet -= newTask)
-          thread.setName(oldName)
-        }
-      }, Mechanism.executor)
-    }
-
-    newTask
+  def flatMap[S](fn: T => Task[S]): Task[S] = new Task[S](parent, id, listener) {
+    private[mechanism] val future: CompletableFuture[Try[S]] =
+      task.future.thenComposeAsync {
+        case Success(value) =>
+          fn(value).future
+        case Failure(e) =>
+          val future = new CompletableFuture[Try[S]]
+          future.completeExceptionally(e)
+          future
+      }
   }
 }
 
-object Mechanism extends Task[Unit](null, "mechanism:/") {
-
-  sealed trait Isolation
-  case object Awaiting extends Isolation
-  case object Isolated extends Isolation
-  case object Parallel extends Isolation
-
-  private[mechanism] def enqueueIsolated(task: Task[_]): Unit = synchronized {
-    if(status != Isolated) status = Awaiting
-    isolationQueue :+= task
-  }
-
-  private[mechanism] var status: Isolation = Parallel
-  private[mechanism] def ready: Boolean = synchronized(status == Awaiting || status == Isolated)
-
-  private[mechanism] var isolationQueue: Vector[Task[_]] = Vector()
-
-  private[mechanism] val executor: ExecutorService = Executors.newWorkStealingPool(100)
+object Task extends Task[Unit](None, "mechanism:/", _ => ()) {
   private[mechanism] var sleeping: Set[Task[_]] = Set()
 
-  private[mechanism] def sleep(task: Task[_]) = synchronized(sleeping += task)
-  private[mechanism] def unsleep(task: Task[_]) = synchronized(sleeping -= task)
+  private[mechanism] def sleep(task: Task[_]) = sleeping += task
+  private[mechanism] def unsleep(task: Task[_]) = sleeping -= task
 
   val future: CompletableFuture[Try[Unit]] = new CompletableFuture()
 }
 
-object Task extends Context(Mechanism)
+sealed trait Update
+case class Progress(v: Int) extends Update
+case object Complete extends Update
+case object Aborted extends Update
+
+object Mechanism extends Context(Task) {
+  private val executor: ExecutorService = Executors.newWorkStealingPool(100)
+  
+  private var children: Map[Task[_], Set[Task[_]]] = Map().withDefault { _ => Set() }
+  private var parents: Map[Task[_], Task[_]] = Map(Task -> Task)
+
+  private val counter: AtomicInteger = new AtomicInteger()
+  private[mechanism] def nextId(): Int = counter.incrementAndGet()
+
+  private[mechanism] def register(name: String, parent: Task[_], child: Task[_]): Unit = synchronized {
+    Thread.currentThread.setName(name)
+    children = children.updated(parent, children.getOrElse(parent, Set()) + child)
+    parents = parents.updated(child, parent)
+  }
+
+  private[mechanism] def unregister(task: Task[_]): Unit = synchronized {
+    val parent: Task[_] = parents.getOrElse(task, Task)
+    Thread.currentThread.setName(s"mechanism://worker-${Mechanism.nextId()}")
+    children = children.updated(parent, children.getOrElse(parent, Set()) - task)
+    if(task != Task) parents = parents - task
+  }
+
+  private[mechanism] def getSubtasks(task: Task[_]): Set[Task[_]] = children.getOrElse(task, Set())
+
+  private[mechanism] def cancel(task: Task[_]): Task[Unit] = {
+    val subtasks = children(task)
+    task.cancelled = true
+    (subtasks.map(cancel(_)) + (task.map(_ => ()))).sequence.map { _ => () }
+  }
+
+  def spawnPeer[T]
+               (current: Task[_], id: String, listener: Update => Unit = { _ => () })
+               (action: Context => Try[T])
+               : Task[T] = {
+    val parent = synchronized(parents(current))
+    spawn(parent, id, listener)(action)
+  }
+
+  private[mechanism] def spawn[T]
+                              (parentTask: Task[_], id: String, listener: Update => Unit = { _ => () })
+                              (action: Context => Try[T])
+                              : Task[T] =
+    new Task[T](Some(parentTask), id, listener) { newTask =>
+      val future: CompletableFuture[Try[T]] = CompletableFuture.supplyAsync({ () =>
+        register(name, parentTask, newTask)
+        try action(Context(newTask)) catch {
+          case NonFatal(e) => Failure(e)
+        } finally unregister(newTask)
+      }, executor)
+    }
+
+  def sequence[Coll[S] <: Iterable[S], T]
+              (tasks: Coll[Task[T]])
+              (implicit cbf: CanBuildFrom[Nothing, T, Coll[T]])
+              : Task[Coll[T]] = {
+    new Task[Coll[T]](None, s"sequence-${Mechanism.nextId()}", { _ => () }) { newTask =>
+      val future: CompletableFuture[Try[Coll[T]]] = {
+        register(name, Task, newTask)
+        CompletableFuture.allOf(tasks.to[List].map(_.future): _*).thenApply { _ =>
+          unregister(newTask)
+          tasks.to[List].map(_.future.get()).sequence.map(_.to[Coll])
+        }
+      }
+    }
+  }
+}
